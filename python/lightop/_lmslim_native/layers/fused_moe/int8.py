@@ -21,6 +21,21 @@ use_lightop = lsenvs.LMSLIM_USE_LIGHTOP
 device_name = lsenvs.LMSLIM_GPU_NAME
 if use_lightop:
     from lightop import moe_gemm_w8a8,get_moe_cuda_config,fuse_silu_mul_quant
+
+def _get_op():
+    """惰性获取 lightop C++ 算子命名空间 (不依赖 LMSLIM_USE_LIGHTOP 开关)."""
+    from lightop import op as _op
+    return _op
+
+def _act_silu_mul(out: torch.Tensor, inp: torch.Tensor) -> None:
+    """silu_and_mul 兼容层: 优先 vllm _C, 回退 lightop 实现."""
+    try:
+        torch.ops._C.silu_and_mul(out, inp)
+        return
+    except AttributeError:
+        pass
+    from lightop import fuse_silu_and_mul as _fsm
+    _fsm(inp.contiguous(), out)
     from .... import op
 from ..gemm.int8_utils import (
    per_token_group_quant_int8, per_token_quant_int8)
@@ -569,6 +584,11 @@ def invoke_fused_moe_kernel_int8(A: torch.Tensor,
     
     M = A.shape[0]
     num_tokens = M * top_k
+    # gemm2 (mul_routed_weight) 形态: A 已是 [M*top_k, K] pair 行,
+    # num_valid 必须用 pair 数 (= topk_ids.numel()), 否则 align 的
+    # pad 哨兵 (= topk_numel) 被当有效 pair → 写回越界 (VM fault).
+    if mul_routed_weight and A.shape[0] == topk_ids.numel():
+        num_tokens = topk_ids.numel()
 
     EM = sorted_token_ids.shape[0]
     if A.shape[0] < config["BLOCK_SIZE_M"]:
@@ -732,7 +752,17 @@ def fused_experts_impl_int8(hidden_states: torch.Tensor,
         status =False
         num_cus=0
         m=curr_hidden_states.shape[0]
-        if use_lightop and per_channel_quant and use_int8_w8a8: #channel-wise cuda
+        if use_lightop and use_int8_w8a8 and block_shape is not None: # group-wise (g128)
+            # Triton block-wise 路径默认配置 (BLOCK_SIZE_K 受 block_shape[1] 约束)
+            config1=config2={"BLOCK_SIZE_M": 16,
+                             "BLOCK_SIZE_N": 64,
+                             "BLOCK_SIZE_K": min(64, block_shape[1]),
+                             "GROUP_SIZE_M": 8,
+                             "num_stages": 2,
+                             "num_warps": 4}
+            config=config1
+            status=False
+        elif use_lightop and per_channel_quant and use_int8_w8a8: #channel-wise cuda
             num_cus=torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
             config1,config2,status=get_moe_cuda_config(E,m,w1.shape[1],w1.shape[2],w2.shape[1],w2.shape[2],top_k_num,device_name,num_cus,compute_type)
             config=config1
@@ -768,7 +798,7 @@ def fused_experts_impl_int8(hidden_states: torch.Tensor,
                                     global_num_experts, expert_map))
 
 
-        if use_lightop and per_channel_quant and status and use_int8_w8a8:
+        if use_lightop and per_channel_quant and status and use_int8_w8a8 and block_shape is None:
             moe_gemm_w8a8(qcurr_hidden_states,
                           w1,
                           intermediate_cache1,
@@ -805,7 +835,14 @@ def fused_experts_impl_int8(hidden_states: torch.Tensor,
                                 use_nn_moe=use_nn_moe)
 
         if activation == "silu":
-            if use_lightop and use_int8_w8a8:
+            if use_lightop and use_int8_w8a8 and block_shape is not None:
+                # block-wise (strategy=group, group_size=128): 先 silu_and_mul, 再按
+                # block_shape[1] 做 per-token-group 量化, 与 checkpoint 权重 scale 对齐
+                _act_silu_mul(intermediate_cache2,
+                              intermediate_cache1.view(-1, N))
+                qintermediate_cache2, qa2_scale = per_token_group_quant_int8(
+                    intermediate_cache2, block_shape[1])
+            elif use_lightop and use_int8_w8a8:
                 qintermediate_cache2, qa2_scale = fuse_silu_mul_quant(intermediate_cache1.view(-1, N))
             else:
                 torch.ops._C.silu_and_mul(intermediate_cache2,
@@ -842,7 +879,7 @@ def fused_experts_impl_int8(hidden_states: torch.Tensor,
 
 
 
-        if use_lightop and per_channel_quant and status and use_int8_w8a8:
+        if use_lightop and per_channel_quant and status and use_int8_w8a8 and block_shape is None:
             moe_gemm_w8a8(qintermediate_cache2,
                           w2,
                           intermediate_cache3,
@@ -880,9 +917,17 @@ def fused_experts_impl_int8(hidden_states: torch.Tensor,
                                 use_nn_moe=use_nn_moe)
 
         if use_lightop and shared_output is not None:
-            op.moe_sum(input=intermediate_cache3.view(*intermediate_cache3.shape),
+            _get_op().moe_sum(input=intermediate_cache3.view(*intermediate_cache3.shape),
                        output=out_hidden_states[begin_chunk_idx:end_chunk_idx],
                        bias=shared_output[begin_chunk_idx:end_chunk_idx],
+                       expert_mask=None,
+                       num_local_tokens=None,
+                       factor=routed_scaling_factor)
+        elif use_lightop:
+            # 无 shared expert 时仍需把 topk 维归约写回输出 (此前分支被注释导致输出全零)
+            _get_op().moe_sum(input=intermediate_cache3.view(*intermediate_cache3.shape),
+                       output=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                       bias=None,
                        expert_mask=None,
                        num_local_tokens=None,
                        factor=routed_scaling_factor)

@@ -87,10 +87,19 @@ def moe_align_block_size(
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
+    # 哨兵填充: pad 项 = topk_numel (越界值), 使 kernel 的
+    # token_mask (offs_token < num_valid) 正确跳过 pad lane.
+    # lightop C++ align 的 fuse_fill 在部分 kernel 变体中未生效
+    # (实测 pad 区残留 0/历史值, 与合法 pair0 冲突).
+    sorted_ids.fill_(1 << 30)  # 大哨兵: gemm1/gemm2 双语义下均判无效
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
     expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
+    # 预填 -1: align C++ 只填 num_post 覆盖的块; npost 不对齐 16 时,
+    # 尾部部分块的 expert_ids 残留未初始化垃圾 (可能是 < E 的合法值),
+    # kernel 会用垃圾 expert 读 qweight → VM fault.
+    expert_ids.fill_(-1)
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
     if use_lightop:

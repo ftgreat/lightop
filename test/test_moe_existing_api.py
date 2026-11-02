@@ -142,12 +142,15 @@ PERMUTATION_APIS = [
 
 
 ROUTING_APIS = [
+    "bf16_mega_gate_hcu",
     "kimi_k2_moe_fused_gate",
     "moe_align_block_size",
     "moe_align_block_size_out",
     "moe_fused_gate",
     "moe_fused_gate_sqrtsoftplus",
     "moe_fused_gate_sqrtsoftplus_v41_hcu",
+    "moe_fused_gate_sqrtsoftplus_v41_hcu_fused",
+    "moe_fused_gate_sqrtsoftplus_v41_hcu_deepep",
     "moe_sum",
     "topk_ids_postprocess",
     "topk_softmax",

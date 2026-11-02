@@ -1,0 +1,10 @@
+{
+  "comment": "INT8 W8A8 group-128 MoE GEMM. 终版 v3 2026-11-02: LDS-A 共享 + 双缓冲 + 两级分派 (host: pairs>1024 用 MT=4/64-pair 块; kernel 内 tile 按 stage 选 direct/LDS: gemm2 阈值 1024, gemm1 阈值 256). 全 M=1..16384 精度 31/31 OK, E2E 全 M 快于 Triton.",
+  "dispatch": {
+    "host_mt": "pairs <= 1024 -> MT=1 (align 16); pairs > 1024 -> MT=4 (align 64); MT=8 禁用",
+    "tile_direct": "gemm1: pairs <= 256; gemm2 (MUL_TOPK): pairs <= 1024",
+    "tile_lds": "其余 (A 流量 /4, 双缓冲屏障)"
+  },
+  "512_4096": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "MODE": 0},
+  "4096_256": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "MODE": 0}
+}

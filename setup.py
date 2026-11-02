@@ -363,9 +363,14 @@ class BuildReleaseExtension(BuildExtension):
             marlin_w4a8_dir = os.path.abspath('./csrc/marlinw4a8/')
             marlin_w4fp8_dir = os.path.abspath('./csrc/marlinw4fp8/')  # 如果也需要特殊处理
 
+            # moe_fused_gate 在 gfx928/936/938 上会触发 dcc 后端 MachineSinker 段错误，
+            # 需要单独用 -mllvm -disable-machine-sink 编译
+            moe_fused_gate_basename = 'moe_fused_gate.hip' if IS_HIP_EXTENSION else 'moe_fused_gate.cu'
+
             marlin_w4a16_sources = []
             marlin_w4a8_sources = []
             marlin_w4fp8_sources = []
+            moe_fused_gate_sources = []
             other_sources = []
 
             for s in sources:
@@ -376,12 +381,15 @@ class BuildReleaseExtension(BuildExtension):
                     marlin_w4a8_sources.append(s)
                 elif abs_path.startswith(marlin_w4fp8_dir):
                     marlin_w4fp8_sources.append(s)
+                elif os.path.basename(abs_path) == moe_fused_gate_basename:
+                    moe_fused_gate_sources.append(s)
                 else:
                     other_sources.append(s)
-            
+
             marlin_w4a16_objects = [obj for src, obj in zip(sources, objects) if src in marlin_w4a16_sources]
             marlin_w4a8_objects = [obj for src, obj in zip(sources, objects) if src in marlin_w4a8_sources]
             marlin_w4fp8_objects = [obj for src, obj in zip(sources, objects) if src in marlin_w4fp8_sources]
+            moe_fused_gate_objects = [obj for src, obj in zip(sources, objects) if src in moe_fused_gate_sources]
             other_objects = [obj for src, obj in zip(sources, objects) if src in other_sources]
             
             with_cuda = any(map(_is_cuda_file, sources))
@@ -421,6 +429,41 @@ class BuildReleaseExtension(BuildExtension):
                     with_cuda=with_cuda
                 )
             
+            # compile moe_fused_gate: 规避 dcc MachineSinker 段错误
+            if moe_fused_gate_sources:
+                if isinstance(extra_postargs, dict):
+                    mfg_post_cflags = extra_postargs['cxx']
+                else:
+                    mfg_post_cflags = list(extra_postargs)
+                if IS_HIP_EXTENSION:
+                    mfg_post_cflags = COMMON_HIP_FLAGS + mfg_post_cflags
+                append_std17_if_no_std_present(mfg_post_cflags)
+
+                mfg_cuda_post_cflags = None
+                if with_cuda:
+                    if isinstance(extra_postargs, dict):
+                        mfg_cuda_post_cflags = extra_postargs['nvcc']
+                    else:
+                        mfg_cuda_post_cflags = list(extra_postargs)
+                    if IS_HIP_EXTENSION:
+                        mfg_cuda_post_cflags = mfg_cuda_post_cflags + _get_rocm_arch_flags(mfg_cuda_post_cflags)
+                        mfg_cuda_post_cflags = COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS + mfg_cuda_post_cflags
+                    append_std17_if_no_std_present(mfg_cuda_post_cflags)
+                    mfg_cuda_post_cflags += ['-mllvm', '-disable-machine-sink']
+                    mfg_cuda_post_cflags = [shlex.quote(f) for f in mfg_cuda_post_cflags]
+
+                _write_ninja_file_and_compile_objects(
+                    sources=moe_fused_gate_sources,
+                    objects=moe_fused_gate_objects,
+                    cflags=[shlex.quote(f) for f in extra_cc_cflags + common_cflags],
+                    post_cflags=[shlex.quote(f) for f in mfg_post_cflags],
+                    cuda_cflags=[shlex.quote(f) for f in common_cflags] if with_cuda else None,
+                    cuda_post_cflags=mfg_cuda_post_cflags if with_cuda else None,
+                    build_directory=output_dir,
+                    verbose=True,
+                    with_cuda=with_cuda
+                )
+
             # compile w4a16
             if marlin_w4a16_sources:
                 marlin_cxx_flags = ['-O3', '-w']
@@ -512,7 +555,7 @@ class BuildReleaseExtension(BuildExtension):
                     with_cuda=with_cuda
                 )
             
-            return other_objects + marlin_w4a16_objects + marlin_w4a8_objects + marlin_w4fp8_objects
+            return other_objects + moe_fused_gate_objects + marlin_w4a16_objects + marlin_w4a8_objects + marlin_w4fp8_objects
 
         self.compiler.compile = unix_wrap_ninja_compile
         build_ext.build_extensions(self)
@@ -559,6 +602,10 @@ def get_extensions():
                glob.glob('./csrc/bmm_scale/*.cu') + glob.glob('./csrc/mla/*.cu') + \
                glob.glob('./csrc/polyfill/*.cu') + glob.glob('./csrc/awq_w4a16_gemm/*.cu') + \
                glob.glob('./csrc/sampling/*.cu') + glob.glob('./csrc/cp_output/*.cu')
+
+    # group128 kernel 由 group128_ext.py 运行时 JIT 独立编译 (自带 PYBIND),
+    # 编入主构建会与 export_hip.cpp 的 PyInit_op 冲突, 必须排除.
+    op_files = [f for f in op_files if 'moe_w8a8_group128' not in f]
 
     extension = CUDAExtension
     # 添加marlinw4a16目录的包含路径

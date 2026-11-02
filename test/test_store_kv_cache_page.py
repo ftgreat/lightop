@@ -202,8 +202,19 @@ def run_test_case(
     custom_kernel_available = store_kvcache_paged_custom(**args_custom)
 
     if custom_kernel_available:
-        k_correct = torch.allclose(args_ref["k_cache"], args_custom["k_cache"], atol=1)
-        v_correct = torch.allclose(args_ref["v_cache"], args_custom["v_cache"], atol=1)
+        # 在 GPU 余量不足时分块比较，避免比较时物化大临时张量触发 OOM
+        k_diff = 0.0
+        v_diff = 0.0
+        ref_k = args_ref["k_cache"]
+        cus_k = args_custom["k_cache"]
+        ref_v = args_ref["v_cache"]
+        cus_v = args_custom["v_cache"]
+        for start in range(0, ref_k.shape[0], 2048):
+            end = min(start + 2048, ref_k.shape[0])
+            k_diff = max(k_diff, (ref_k[start:end].float() - cus_k[start:end].float()).abs().max().item())
+            v_diff = max(v_diff, (ref_v[start:end].float() - cus_v[start:end].float()).abs().max().item())
+        k_correct = k_diff <= 1
+        v_correct = v_diff <= 1
         if k_correct and v_correct:
             print("✅ Correctness Test Passed: Custom kernel matches the torch reference.")
         else:
